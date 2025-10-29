@@ -45,6 +45,9 @@ from ...utils import TransformersKwargs, auto_docstring, can_return_tuple
 from ...utils.generic import check_model_inputs
 from .configuration_qwen3 import Qwen3Config
 
+# Import NKI QKV kernels
+from neuronxcc.nki._pre_prod_kernels.qkv_cte_impl import nki_qkv_projection_cte_impl
+from neuronxcc.nki._pre_prod_kernels import NormType, QKVOutputLayout
 
 @use_kernel_forward_from_hub("RMSNorm")
 class Qwen3RMSNorm(nn.Module):
@@ -220,12 +223,12 @@ def eager_attention_forward(
     return attn_output, attn_weights
 
 
+
 class Qwen3Attention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
     def __init__(self, config: Qwen3Config, layer_idx: int):
         super().__init__()
-        self.layer_type = config.layer_types[layer_idx] if hasattr(config, "layer_types") else None
         self.config = config
         self.layer_idx = layer_idx
         self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
@@ -234,22 +237,75 @@ class Qwen3Attention(nn.Module):
         self.attention_dropout = config.attention_dropout
         self.is_causal = True
 
+        # QKV projection configuration
+        self.hidden_size = config.hidden_size
+        self.num_attention_heads = config.num_attention_heads
+        self.num_key_value_heads = config.num_key_value_heads
+        
+        # Qwen3 always has separate Q, K, V projections
         self.q_proj = nn.Linear(
-            config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias
+            self.hidden_size, self.num_attention_heads * self.head_dim, bias=config.attention_bias
         )
         self.k_proj = nn.Linear(
-            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
+            self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias
         )
         self.v_proj = nn.Linear(
-            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
+            self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias
         )
+            
         self.o_proj = nn.Linear(
-            config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
+            self.num_attention_heads * self.head_dim, self.hidden_size, bias=config.attention_bias
         )
-        self.q_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)  # unlike olmo, only on the head dim!
-        self.k_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)  # thus post q_norm does not need reshape
-        self.sliding_window = config.sliding_window if self.layer_type == "sliding_attention" else None
+        
+        self.q_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.sliding_window = config.sliding_window if config.layer_types[layer_idx] == "sliding_attention" else None
 
+        self.rms_norm_eps = config.rms_norm_eps
+        
+    def _kernel_qkv_forward(self, hidden_states):
+        """Forward pass using NKI QKV kernel"""
+        print(f"S (sequence_length) = {hidden_states.shape[1]}")
+        print(f"H (num_attention_heads) = {self.num_attention_heads}")
+        print(f"I (heads * head_dim) = {self.num_attention_heads * self.head_dim}")
+        print(f"norm_type = NormType.NO_NORM")
+        print(f"output_layout = QKVOutputLayout.BSD")
+        print(f"hidden_states.shape = {hidden_states.shape}")
+        
+        fused_qkv_weight = torch.cat([
+            self.q_proj.weight,
+            self.k_proj.weight,
+            self.v_proj.weight
+        ], dim=0).t()
+        
+        qkv = nki_qkv_projection_cte_impl(
+            hidden_states,
+            fused_qkv_weight,
+            norm_weights=None,
+            mlp_prev=None,
+            attn_prev=None,
+            d_head=None,
+            output_layout=QKVOutputLayout.BSD,
+            eps=self.rms_norm_eps,
+            norm_type=NormType.NO_NORM,
+            use_dma_transpose=True,
+            qkvInSB=False,
+            bias=None,
+            norm_b=None
+        )
+        
+        print(f"qkv output shape = {qkv.shape}")        
+
+        # shape of QKV is [batch, seqlen, fused_qkv_size]
+        # we split the fused QKV (dim=2) into Q, K, V
+
+        q_size = self.num_attention_heads * self.head_dim
+        k_size = self.num_key_value_heads * self.head_dim
+        v_size = self.num_key_value_heads * self.head_dim
+        
+        return torch.split(qkv, [q_size, k_size, v_size], dim=2)
+    
+    @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -257,14 +313,17 @@ class Qwen3Attention(nn.Module):
         attention_mask: Optional[torch.Tensor],
         past_key_values: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        rmsnorm: Optional[nn.Module] = None,
+        residual: Optional[torch.Tensor] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
-        query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
-        key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        Q, K, V = self._kernel_qkv_forward(hidden_states)
+        query_states = self.q_norm(Q.view(hidden_shape)).transpose(1, 2)
+        key_states = self.k_norm(K.view(hidden_shape)).transpose(1, 2)
+        value_states = V.view(hidden_shape).transpose(1, 2)
 
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
@@ -274,9 +333,7 @@ class Qwen3Attention(nn.Module):
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
-        attention_interface: Callable = eager_attention_forward
-        if self.config._attn_implementation != "eager":
-            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+        attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
         attn_output, attn_weights = attention_interface(
             self,
@@ -292,6 +349,7 @@ class Qwen3Attention(nn.Module):
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
+        
         return attn_output, attn_weights
 
 
