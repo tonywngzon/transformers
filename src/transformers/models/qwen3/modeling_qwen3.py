@@ -305,7 +305,6 @@ class Qwen3Attention(nn.Module):
         
         return torch.split(qkv, [q_size, k_size, v_size], dim=2)
     
-    @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
     def forward(
         self,
         hidden_states: torch.Tensor,
