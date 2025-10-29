@@ -46,7 +46,7 @@ from ...utils.generic import check_model_inputs
 from .configuration_qwen3 import Qwen3Config
 
 # Import NKI QKV kernels
-from neuronxcc.nki._pre_prod_kernels.qkv_cte_impl import nki_qkv_projection_cte_impl
+from neuronxcc.nki._pre_prod_kernels.qkv import nki_qkv_projection_isa_kernel
 from neuronxcc.nki._pre_prod_kernels import NormType, QKVOutputLayout
 
 @use_kernel_forward_from_hub("RMSNorm")
@@ -278,7 +278,7 @@ class Qwen3Attention(nn.Module):
             self.v_proj.weight
         ], dim=0).t()
         
-        qkv = nki_qkv_projection_cte_impl(
+        qkv = nki_qkv_projection_isa_kernel(
             hidden_states,
             fused_qkv_weight,
             norm_weights=None,
